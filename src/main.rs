@@ -1,39 +1,27 @@
-use node::*;
-use clap::Parser;
-use std::io;
-use std::thread::sleep;
-use std::time::Duration;
-use tokio::sync::mpsc;
 use api::TcpApi;
+use clap::Parser;
+use node::*;
+use tokio::sync::mpsc;
 
 #[macro_use]
 extern crate log;
 extern crate env_logger;
 
-mod node;
-mod state;
-mod transport;
 mod api;
+mod node;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     let config = NodeConfig::parse();
-
-    let (tx, mut rx) = mpsc::channel::<String>(32);
-
+    let (tx, _rx) = mpsc::channel::<String>(32);
     let mut tcp_server = TcpApi::new(config.addr);
 
-    tokio::spawn( async move {
-        loop {
-            debug!("msg received: {:?}", rx.recv().await.unwrap());
+    match tcp_server.run(tx.clone()).await {
+        Ok(_) => {
+            info!("server exited successfully");
         }
-    });
-
-    tcp_server.run(tx.clone()).await;
-
-    sleep(Duration::from_secs(50));
-
-    ()
+        Err(_) => error!("TCP server crashed"),
+    }
 }
