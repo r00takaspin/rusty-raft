@@ -9,6 +9,7 @@ extern crate env_logger;
 
 mod api;
 mod node;
+mod state;
 
 #[tokio::main]
 async fn main() {
@@ -19,9 +20,7 @@ async fn main() {
     let mut tcp_server = TcpApi::new(config.addr);
 
     match tcp_server.run(tx.clone()).await {
-        Ok(_) => {
-            info!("server exited successfully");
-        }
+        Ok(_) => info!("server exited successfully"),
         Err(_) => error!("TCP server crashed"),
     }
 }
