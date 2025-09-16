@@ -1,8 +1,10 @@
+use crate::messages::Request;
 use anyhow::{Result, anyhow};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
 use tracing::Instrument;
 
 pub struct TcpApi {
@@ -15,12 +17,42 @@ struct Response {
     is_exit: bool,
 }
 
+impl Response {
+    fn success(msg: String) -> Self {
+        Self {
+            msg: format!("{}\n", msg),
+            is_exit: false,
+        }
+    }
+
+    fn error(error_msg: String) -> Self {
+        Self {
+            msg: format!("error: {}\n", error_msg),
+            is_exit: false,
+        }
+    }
+
+    fn exit() -> Self {
+        Self {
+            msg: "bye\n".to_string(),
+            is_exit: true,
+        }
+    }
+
+    fn unknown(command: &str) -> Self {
+        Self {
+            msg: format!("unknown command: {}\n", command),
+            is_exit: false,
+        }
+    }
+}
+
 impl TcpApi {
     pub fn new(addr: String) -> Self {
         Self { addr }
     }
 
-    pub async fn run(&mut self, sender: Sender<String>) -> io::Result<()> {
+    pub async fn run(&mut self, sender: Sender<Request>) -> io::Result<()> {
         let listener = TcpListener::bind(self.addr.clone()).await?;
 
         tokio::spawn(async move {
@@ -41,7 +73,7 @@ impl TcpApi {
     }
 }
 
-async fn handle_conn(mut socket: TcpStream, tx: Sender<String>) {
+async fn handle_conn(mut socket: TcpStream, tx: Sender<Request>) {
     loop {
         let mut buf: [u8; 1024] = [0; 1024];
 
@@ -65,7 +97,7 @@ async fn handle_conn(mut socket: TcpStream, tx: Sender<String>) {
             }
         };
 
-        info!("-> client {}", msg);
+        info!("-> client {}", msg.trim());
 
         match handle_request(&msg, tx.clone()).await {
             Ok(response) => {
@@ -75,7 +107,7 @@ async fn handle_conn(mut socket: TcpStream, tx: Sender<String>) {
                 }
 
                 if !response.msg.is_empty() {
-                    info!("<- client: {}", response.msg);
+                    info!("<- client: {}", response.msg.trim());
                 }
 
                 // client closed connection
@@ -90,43 +122,46 @@ async fn handle_conn(mut socket: TcpStream, tx: Sender<String>) {
     }
 }
 
-async fn handle_request(request_msg: &str, tx: Sender<String>) -> Result<Response> {
-    if request_msg.starts_with("set") {
-        tx.send(request_msg.trim().to_string()).await?;
-        Ok(Response {
-            msg: "ok\n".to_string(),
-            is_exit: false,
-        })
-    } else if request_msg.eq("state") {
-        Ok(Response {
-            msg: "state: unknown\n".to_string(),
-            is_exit: false,
-        })
-    } else if request_msg.eq("exit") || request_msg.starts_with("quit") {
-        Ok(Response {
-            msg: "bye\n".to_string(),
-            is_exit: true,
-        })
-    } else {
-        Ok(Response {
-            msg: format!("unknown command: {}\n", request_msg),
-            is_exit: false,
-        })
+async fn handle_request(request_msg: &str, tx: Sender<Request>) -> Result<Response> {
+    let trimmed_msg = request_msg.trim();
+
+    match trimmed_msg {
+        "exit" | "quit" => Ok(Response::exit()),
+        cmd if cmd == "state" || cmd.starts_with("set") || cmd.starts_with("request_vote") => {
+            handle_command(cmd, tx).await
+        }
+        _ => Ok(Response::unknown(trimmed_msg)),
     }
 }
 
-async fn handle_response(response: &Response, socket: &mut TcpStream) -> Result<(), anyhow::Error> {
-    match socket.write_all(response.msg.as_bytes()).await {
-        Ok(_) => {}
-        Err(err) => return Err(anyhow!("socket write error: {err:?}")),
+async fn handle_command(command: &str, tx: Sender<Request>) -> Result<Response> {
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    tx.send(Request {
+        command: command.to_string(),
+        resp_tx,
+    })
+    .await
+    .map_err(|e| anyhow!("failed to send request: {}", e))?;
+
+    match resp_rx.await {
+        Ok(resp) => Ok(Response::success(resp.msg)),
+        Err(e) => Ok(Response::error(format!("receive error: {}", e))),
     }
+}
+
+async fn handle_response(response: &Response, socket: &mut TcpStream) -> Result<()> {
+    socket
+        .write_all(response.msg.as_bytes())
+        .await
+        .map_err(|err| anyhow!("socket write error: {err:?}"))?;
 
     if response.is_exit {
-        match socket.shutdown().await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(anyhow!("socket shutdown error: {err}")),
-        }
-    } else {
-        Ok(())
+        socket
+            .shutdown()
+            .await
+            .map_err(|err| anyhow!("socket shutdown error: {err}"))?;
     }
+
+    Ok(())
 }

@@ -5,7 +5,7 @@ use clap::Parser;
 pub struct NodeConfig {
     /// Unique node ID
     #[arg(short, long)]
-    pub id: u32,
+    pub id: String,
 
     /// List of peer addresses (comma-separated)
     #[arg(short, long, value_delimiter = ',', num_args = 1..)]
