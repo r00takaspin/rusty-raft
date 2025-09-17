@@ -1,4 +1,4 @@
-use crate::messages::Request;
+use crate::messages::*;
 use anyhow::{Result, anyhow};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,31 +18,10 @@ struct Response {
 }
 
 impl Response {
-    fn success(msg: String) -> Self {
+    fn new(msg: String, is_exit: bool) -> Self {
         Self {
-            msg: format!("{}\n", msg),
-            is_exit: false,
-        }
-    }
-
-    fn error(error_msg: String) -> Self {
-        Self {
-            msg: format!("error: {}\n", error_msg),
-            is_exit: false,
-        }
-    }
-
-    fn exit() -> Self {
-        Self {
-            msg: "bye\n".to_string(),
-            is_exit: true,
-        }
-    }
-
-    fn unknown(command: &str) -> Self {
-        Self {
-            msg: format!("unknown command: {}\n", command),
-            is_exit: false,
+            msg: format!("{msg}\n"),
+            is_exit,
         }
     }
 }
@@ -52,7 +31,7 @@ impl TcpApi {
         Self { addr }
     }
 
-    pub async fn run(&mut self, sender: Sender<Request>) -> io::Result<()> {
+    pub async fn run(&mut self, sender: Sender<NodeMessage>) -> io::Result<()> {
         let listener = TcpListener::bind(self.addr.clone()).await?;
 
         tokio::spawn(async move {
@@ -73,7 +52,7 @@ impl TcpApi {
     }
 }
 
-async fn handle_conn(mut socket: TcpStream, tx: Sender<Request>) {
+async fn handle_conn(mut socket: TcpStream, tx: Sender<NodeMessage>) {
     loop {
         let mut buf: [u8; 1024] = [0; 1024];
 
@@ -122,31 +101,49 @@ async fn handle_conn(mut socket: TcpStream, tx: Sender<Request>) {
     }
 }
 
-async fn handle_request(request_msg: &str, tx: Sender<Request>) -> Result<Response> {
-    let trimmed_msg = request_msg.trim();
-
-    match trimmed_msg {
-        "exit" | "quit" => Ok(Response::exit()),
-        cmd if cmd == "state" || cmd.starts_with("set") || cmd.starts_with("request_vote") => {
-            handle_command(cmd, tx).await
-        }
-        _ => Ok(Response::unknown(trimmed_msg)),
-    }
-}
-
-async fn handle_command(command: &str, tx: Sender<Request>) -> Result<Response> {
+async fn handle_request(
+    request_msg: &str,
+    tx: Sender<NodeMessage>,
+) -> Result<Response, anyhow::Error> {
     let (resp_tx, resp_rx) = oneshot::channel();
 
-    tx.send(Request {
-        command: command.to_string(),
-        resp_tx,
-    })
-    .await
-    .map_err(|e| anyhow!("failed to send request: {}", e))?;
+    let message_json: serde_json::Value = serde_json::from_str(request_msg)?;
+    let message: RpcMessage = serde_json::from_value(message_json.clone())?;
+
+    let node_message = NodeMessage {
+        rpc_message: message,
+        resp_tx: Some(resp_tx),
+    };
+
+    tx.send(node_message)
+        .await
+        .map_err(|e| anyhow!("failed to send request: {}", e))?;
 
     match resp_rx.await {
-        Ok(resp) => Ok(Response::success(resp.msg)),
-        Err(e) => Ok(Response::error(format!("receive error: {}", e))),
+        Ok(RpcMessage::SetResponse(resp)) => {
+            let msg = serde_json::to_string(&resp)?;
+
+            Ok(Response::new(msg, false))
+        }
+        Ok(RpcMessage::StateResponse(resp)) => {
+            let msg = serde_json::to_string(&resp)?;
+
+            Ok(Response::new(msg, false))
+        }
+        Ok(RpcMessage::RequestVoteResponse(resp)) => {
+            let msg = serde_json::to_string(&resp)?;
+
+            Ok(Response::new(msg, false))
+        }
+        _ => {
+            let resp = RpcMessage::Error(ErrorResponse{
+                err_msg: "unknown request".to_string(),
+            });
+            
+            let msg = serde_json::to_string(&resp)?;
+            
+            Ok(Response::new(msg, false))
+        },
     }
 }
 

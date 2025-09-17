@@ -2,7 +2,7 @@ use crate::state::NodeState;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 
-pub trait Storage {
+pub trait Storage: Send + Sync {
     fn load(&self) -> Result<Box<NodeState>, anyhow::Error>;
     fn save(&self, state: &NodeState) -> Result<(), anyhow::Error>;
 }

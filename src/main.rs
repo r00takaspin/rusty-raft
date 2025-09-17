@@ -2,10 +2,9 @@ use crate::state::{Node, NodeState};
 use crate::storage::{JsonStorage, Storage};
 use clap::Parser;
 use config::*;
-use std::fs::File;
-use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use transport::server::TcpApi;
 
 #[macro_use]
@@ -23,16 +22,16 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let config = NodeConfig::parse();
-    let (tx, rx) = mpsc::channel::<messages::Request>(32);
+    let (tx, rx) = mpsc::channel::<messages::NodeMessage>(32);
 
     let storage = JsonStorage::new(&config.log_path[..]);
-    let mut node_state = NodeState::default(config.id, config.peers);
+    let mut node_state = NodeState::default(config.clone().id, config.peers);
 
     match storage.load() {
         Ok(res) => {
             node_state = *res;
 
-            info!("loaded node state: {:?}", node_state);
+            info!("node state: {node_state:?}");
         }
         Err(err) => {
             if storage.save(&node_state).is_err() {
@@ -41,15 +40,20 @@ async fn main() {
                 return;
             }
 
-            info!("loaded default node state: {:?}", node_state);
+            info!("default node state: {node_state:?}");
         }
     }
 
     let mut node = Node::new(node_state, rx, Arc::new(Box::new(storage)));
 
-    tokio::spawn(async move {
-        node.run().await;
-    });
+    let span = tracing::info_span!("node", node_id = %config.id, addr  = %config.addr);
+
+    tokio::spawn(
+        async move {
+            node.run().await;
+        }
+        .instrument(span),
+    );
 
     let mut tcp_server = TcpApi::new(config.addr);
     match tcp_server.run(tx.clone()).await {
