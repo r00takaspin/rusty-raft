@@ -14,4 +14,8 @@ pub struct NodeConfig {
     /// Address to bind this node to
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     pub addr: String,
+
+    /// Path to persistent file storage
+    #[arg(short, long)]
+    pub log_path: String,
 }
