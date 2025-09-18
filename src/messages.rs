@@ -1,4 +1,4 @@
-use crate::state::{NodeId, NodeRole};
+use crate::state::{Index, NodeId, NodeRole};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -39,7 +39,7 @@ pub struct RequestVoteRequest {
     pub node_id: NodeId,
     pub term: u64,
     pub last_log_term: u64,
-    pub last_log_index: u64,
+    pub last_log_index: Index,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -3,10 +3,10 @@ use crate::state::NodeRole::{Candidate, Follower, Leader};
 use crate::storage::Storage;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
+use std::cmp::max;
 use std::fmt::Display;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot::Sender;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum NodeRole {
@@ -16,23 +16,32 @@ pub enum NodeRole {
 }
 
 pub type NodeId = String;
-pub type Index = u64;
+pub type Index = usize;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct LogEntry {
     term: u64,
+    index: usize,
     command: String,
+    commit_index: Option<Index>,
 }
 
 impl LogEntry {
-    pub fn new(term: u64, command: String) -> Self {
-        Self { term, command }
+    pub fn new(index: usize, term: u64, command: &str, commit_index: Option<Index>) -> Self {
+        Self {
+            index,
+            term,
+            command: command.to_string(),
+            commit_index,
+        }
     }
 
     pub fn initial() -> Self {
         Self {
+            index: 0,
             term: 0,
             command: "initial".to_string(),
+            commit_index: Some(0),
         }
     }
 }
@@ -93,6 +102,8 @@ pub struct NodeState {
     term: u64,
     log: Vec<LogEntry>,
     voted_for: Option<NodeId>,
+    commit_index: Index,
+    leader_id: Option<NodeId>,
 }
 
 impl NodeState {
@@ -108,6 +119,8 @@ impl NodeState {
             term: 0,
             voted_for: None,
             log: log_entries,
+            commit_index: 0,
+            leader_id: None,
         }
     }
 
@@ -142,7 +155,7 @@ impl NodeState {
         }
 
         // node has move actual log records
-        if (self.log.len() - 1) as u64 > last_log_index {
+        if (self.log.len() - 1) > last_log_index {
             return (false, self.term);
         }
 
@@ -157,6 +170,84 @@ impl NodeState {
         (true, self.term)
     }
 
+    fn append_log(
+        &mut self,
+        leader_id: NodeId,
+        leader_term: u64,
+        prev_log_index: Index,
+        prev_log_term: u64,
+        leader_commit_index: Index,
+        leader_log: Vec<LogEntry>,
+    ) -> (bool, u64) {
+        // leader becomes follower if follower term is newer
+        if self.term > leader_term {
+            return (false, self.term);
+        }
+
+        if let Some(log_msg) = self.log.get(prev_log_index) {
+            // previous log message doesn't match leader term
+            if log_msg.term != prev_log_term {
+                return (false, self.term);
+            }
+        // log messages doesn't exists on follower
+        } else {
+            return (false, self.term);
+        }
+
+        for _ in prev_log_index..self.log.len() - 1 {
+            self.log.pop();
+        }
+
+        // prev log index must point to the tail of log
+        if prev_log_index != self.log.len() - 1 {
+            return (false, self.term);
+        }
+
+        if !self.merge_logs(leader_log) {
+            return (false, self.term);
+        }
+
+        // log consistency check ok
+
+        // TODO: apply log records in separate thread
+        for i in self.commit_index..=leader_commit_index {
+            self.log[i as usize].commit_index = Some(leader_commit_index);
+        }
+
+        if !self.update_term(leader_term) {
+            error!("follower cannot update term to leader's term");
+
+            return (false, self.term);
+        }
+
+        self.leader_id = Some(leader_id);
+        self.commit_index = max(leader_commit_index, self.commit_index);
+
+        (true, self.term)
+    }
+
+    fn merge_logs(&mut self, leader_log_chunk: Vec<LogEntry>) -> bool {
+        if leader_log_chunk.is_empty() {
+            return true;
+        }
+
+        if leader_log_chunk[0].index != self.log.len() {
+            return false;
+        }
+
+        for log in leader_log_chunk.into_iter() {
+            let log_index = log.index;
+
+            if log_index != self.log.len() {
+                return false;
+            }
+
+            self.log.push(log);
+        }
+
+        return true;
+    }
+
     fn update_term(&mut self, term: u64) -> bool {
         if term > self.term {
             self.term = term;
@@ -167,6 +258,7 @@ impl NodeState {
         false
     }
 
+    // use only for test purposes
     fn add_log(&mut self, log: LogEntry) {
         self.log.push(log);
     }
@@ -328,7 +420,7 @@ mod tests {
     #[test]
     fn test_node_request_vote_same_node() {
         let mut state = NodeState::default("1".into(), vec![]);
-        let (got_ok, term) = state.request_vote("1".to_string(), 0, 0, 0);
+        let (got_ok, term) = state.request_vote("1".into(), 0, 0, 0);
         assert_eq!(false, got_ok);
         assert_eq!(0, term);
     }
@@ -337,7 +429,7 @@ mod tests {
     fn test_node_request_vote_lower_term() {
         let mut state = NodeState::default("1".into(), vec![]);
         state.update_term(1);
-        let (got_ok, term) = state.request_vote("2".to_string(), 0, 0, 0);
+        let (got_ok, term) = state.request_vote("2".into(), 0, 0, 0);
         assert_eq!(false, got_ok);
         assert_eq!(1, term);
     }
@@ -345,11 +437,11 @@ mod tests {
     #[test]
     fn test_node_request_vote_same_term_twice() {
         let mut state = NodeState::default("1".into(), vec![]);
-        let (got_ok, term) = state.request_vote("2".to_string(), 1, 0, 0);
+        let (got_ok, term) = state.request_vote("2".into(), 1, 0, 0);
         assert_eq!(true, got_ok);
         assert_eq!(1, term);
 
-        let (got_ok, term) = state.request_vote("2".to_string(), 1, 0, 0);
+        let (got_ok, term) = state.request_vote("2".into(), 1, 0, 0);
         assert_eq!(false, got_ok);
         assert_eq!(1, term);
     }
@@ -357,9 +449,9 @@ mod tests {
     #[test]
     fn test_node_request_log_term_ahead() {
         let mut state = NodeState::default("1".into(), vec![]);
-        state.add_log(LogEntry::new(1, "test command".to_string()));
+        state.add_log(LogEntry::new(1, 1, "test command", None));
 
-        let (got_ok, term) = state.request_vote("2".to_string(), 1, 0, 0);
+        let (got_ok, term) = state.request_vote("2".into(), 1, 0, 0);
         assert_eq!(false, got_ok);
         assert_eq!(1, term);
     }
@@ -367,10 +459,219 @@ mod tests {
     #[test]
     fn test_node_request_log_index_ahead() {
         let mut state = NodeState::default("1".into(), vec![]);
-        state.add_log(LogEntry::new(1, "test command".to_string()));
+        state.add_log(LogEntry::new(1, 1, "test command", None));
 
-        let (got_ok, term) = state.request_vote("2".to_string(), 1, 0, 2);
+        let (got_ok, term) = state.request_vote("2".into(), 1, 0, 2);
         assert_eq!(false, got_ok);
         assert_eq!(0, term);
+    }
+
+    #[test]
+    fn test_node_merge_logs_empty_log() {
+        let mut state = NodeState::default("1".into(), vec![]);
+
+        let ok = state.merge_logs(vec![]);
+        assert_eq!(true, ok);
+    }
+
+    #[test]
+    fn test_node_merge_logs_empty_log_success() {
+        let mut state = NodeState::default("1".into(), vec![]);
+
+        let leader_logs = vec![
+            LogEntry::new(1, 1, "test command", None),
+            LogEntry::new(2, 2, "test command#2", None),
+            LogEntry::new(3, 2, "test command#3", None),
+        ];
+
+        let ok = state.merge_logs(leader_logs);
+        assert_eq!(true, ok);
+    }
+
+    #[test]
+    fn test_node_merge_logs_gap_between_logs() {
+        let mut state = NodeState::default("1".into(), vec![]);
+        let leader_logs = vec![LogEntry::new(2, 1, "test command", None)];
+
+        let ok = state.merge_logs(leader_logs);
+        assert_eq!(false, ok);
+    }
+
+    #[test]
+    fn test_node_merge_logs_broken_index_order() {
+        let mut state = NodeState::default("1".into(), vec![]);
+        let leader_logs = vec![
+            LogEntry::new(1, 1, "test command#1", None),
+            LogEntry::new(3, 1, "test command#2", None),
+            LogEntry::new(2, 1, "test command#3", None),
+        ];
+
+        let ok = state.merge_logs(leader_logs);
+        assert_eq!(false, ok);
+    }
+
+    #[test]
+    fn test_node_append_log_success() {
+        let leader_id = "2".into();
+        let leader_term = 1;
+        let prev_log_index = 0;
+        let prev_log_term = 0;
+        let leader_commit_index = 0;
+
+        let logs = vec![LogEntry::new(1, 1, "test command#1", None)];
+
+        let mut state = NodeState::default("1".into(), vec![]);
+        let (ok, term) = state.append_log(
+            leader_id,
+            leader_term,
+            prev_log_index,
+            prev_log_term,
+            leader_commit_index,
+            logs,
+        );
+        assert_eq!(true, ok);
+        assert_eq!(leader_term, term);
+    }
+
+    #[test]
+    fn test_node_append_log_follower_term_greater() {
+        let leader_id = "2".into();
+        let leader_term = 1;
+        let prev_log_index = 0;
+        let prev_log_term = 0;
+        let leader_commit_index = 0;
+
+        let logs = vec![LogEntry::new(1, 1, "test command#1", None)];
+        let mut state = NodeState::default("1".into(), vec![]);
+        state.update_term(leader_term + 1);
+        let (ok, term) = state.append_log(
+            leader_id,
+            leader_term,
+            prev_log_index,
+            prev_log_term,
+            leader_commit_index,
+            logs,
+        );
+        assert_eq!(false, ok);
+        assert_eq!(leader_term + 1, term);
+    }
+
+    #[test]
+    fn test_node_append_log_prev_log_index_ahead() {
+        let leader_id = "2".into();
+        let leader_term = 1;
+        let prev_log_index = 1;
+        let prev_log_term = 0;
+        let leader_commit_index = 0;
+
+        let logs = vec![LogEntry::new(1, 1, "test command#1", None)];
+        let mut state = NodeState::default("1".into(), vec![]);
+        let (ok, term) = state.append_log(
+            leader_id,
+            leader_term,
+            prev_log_index,
+            prev_log_term,
+            leader_commit_index,
+            logs,
+        );
+        assert_eq!(false, ok);
+        assert_eq!(0, term);
+    }
+
+    #[test]
+    fn test_node_append_log_prev_log_term_incorrect() {
+        let leader_id = "2".into();
+        let leader_term = 2;
+        let prev_log_index = 1;
+        let prev_log_term = 2;
+        let leader_commit_index = 0;
+
+        let logs = vec![LogEntry::new(1, 1, "test command#1", None)];
+        let mut state = NodeState::default("1".into(), vec![]);
+        state.add_log(LogEntry::new(1, 1, "test command#2", None));
+        let (ok, term) = state.append_log(
+            leader_id,
+            leader_term,
+            prev_log_index,
+            prev_log_term,
+            leader_commit_index,
+            logs,
+        );
+        assert_eq!(false, ok);
+        assert_eq!(0, term);
+    }
+
+    #[test]
+    fn test_node_append_log_recover_log() {
+        let leader_term = 3;
+        let prev_log_index = 3;
+        let prev_log_term = 3;
+        let leader_commit_index = 2;
+
+        let leader_logs = vec![LogEntry::new(3, 3, "test command#3", None)];
+        let mut state = NodeState::default("1".into(), vec![]);
+
+        // follower log
+        state.add_log(LogEntry::new(1, 1, "test command#1", None));
+        state.update_term(1);
+
+        let (ok, term) = state.append_log(
+            "2".into(),
+            leader_term,
+            prev_log_index - 1,
+            prev_log_term - 1,
+            leader_commit_index,
+            leader_logs,
+        );
+        assert_eq!(false, ok);
+        assert_eq!(1, term);
+
+        // leader decrements prev_log_index and add new log messages to leader_log
+        let leader_logs = vec![
+            LogEntry::new(2, 2, "test command#2", None),
+            LogEntry::new(3, 3, "test command#3", None),
+        ];
+
+        let (ok, term) = state.append_log(
+            "2".into(),
+            leader_term,
+            prev_log_index - 2,
+            prev_log_term - 2,
+            leader_commit_index,
+            leader_logs,
+        );
+        assert_eq!(true, ok);
+        assert_eq!(leader_term, term);
+        assert_eq!(state.log.len(), 4);
+    }
+
+    #[test]
+    fn test_node_append_log_recover_conflict_log() {
+        let leader_term = 3;
+        let prev_log_index = 1;
+        let prev_log_term = 1;
+        let leader_commit_index = 2;
+
+        let leader_logs = vec![
+            LogEntry::new(2, 2, "actual test command#2", None),
+            LogEntry::new(3, 2, "actual test command#2", None),
+        ];
+
+        let mut state = NodeState::default("1".into(), vec![]);
+        state.add_log(LogEntry::new(1, 1, "sync test command#2", None));
+        state.add_log(LogEntry::new(2, 1, "conflict test command#2", None));
+        state.add_log(LogEntry::new(3, 1, "conflict test command#2", None));
+
+        let (ok, term) = state.append_log(
+            "2".into(),
+            leader_term,
+            prev_log_index,
+            prev_log_term,
+            leader_commit_index,
+            leader_logs,
+        );
+        assert_eq!(true, ok);
+        assert_eq!(leader_term, term);
+        assert_eq!(state.log.len(), 4);
     }
 }
