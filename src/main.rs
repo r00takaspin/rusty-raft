@@ -2,7 +2,9 @@ use crate::state::{Node, NodeState};
 use crate::storage::{JsonStorage, Storage};
 use clap::Parser;
 use config::*;
+use rand::Rng;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 use transport::server::TcpApi;
@@ -44,7 +46,15 @@ async fn main() {
         }
     }
 
-    let mut node = Node::new(node_state, rx, Arc::new(Box::new(storage)));
+    // election timeout between 150 and 300 ms
+    let election_timeout = Duration::from_millis(rand::rng().random_range(150..=300));
+
+    let mut node = Node::new(
+        node_state,
+        rx,
+        Arc::new(Box::new(storage)),
+        election_timeout,
+    );
 
     let span = tracing::info_span!("node", node_id = %config.id, addr  = %config.addr);
 

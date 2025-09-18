@@ -16,9 +16,13 @@ telnet 8080
 < {"node_id":"1","term":5,"role":"Follower"}
 # request vote
 > {"type": "RequestVote", "data": {"node_id": "2", "term": 5, "last_log_term": 0, "last_log_index": 0}}
-< {"success":true,"term":5}
---  
-
+< {"ok":true,"term":5}
+# append log message 
+> {"type":"AppendLogRequest","data":{"leader_id":"2","leader_term":1,"prev_log_index":0,"prev_log_term":0,"leader_commit_index":1,"leader_log":[{"index":1,"term":1,"command":"test 1"}]}}
+> {"ok": true, "term": 1}
+# heartbeat
+> {"type":"HeartbeatRequest","data":{"leader_id":"2","leader_term":1,"prev_log_index":1,"prev_log_term":1,"leader_commit_index":1}}
+< {"ok": true, "term": 1}
 ```
 
 ## Run tests

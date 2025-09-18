@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum NodeRole {
@@ -224,6 +226,45 @@ impl NodeState {
         (true, self.term)
     }
 
+    fn heartbeat(
+        &mut self,
+        leader_id: NodeId,
+        leader_term: u64,
+        prev_log_index: Index,
+        prev_log_term: u64,
+        leader_commit_index: Index,
+    ) -> (bool, u64) {
+        // leader becomes follower if follower term is newer
+        if self.term > leader_term {
+            return (false, self.term);
+        }
+
+        // check follower log consistency
+        if let Some(log_msg) = self.log.get(prev_log_index) {
+            if log_msg.term != prev_log_term {
+                return (false, self.term);
+            }
+        } else {
+            return (false, self.term);
+        }
+
+        if !self.update_term(prev_log_term) {
+            return (false, self.term);
+        }
+
+        let last_index_to_commit = min(self.log.len() - 1, leader_commit_index);
+
+        // TODO: apply log records in separate thread
+
+        for i in self.commit_index..=last_index_to_commit {
+            self.log[i as usize].commit_index = Some(leader_commit_index);
+        }
+
+        self.leader_id = Some(leader_id);
+
+        (true, self.term)
+    }
+
     fn merge_logs(&mut self, leader_log_chunk: Vec<LogEntry>) -> bool {
         if leader_log_chunk.is_empty() {
             return true;
@@ -243,7 +284,7 @@ impl NodeState {
             self.log.push(log);
         }
 
-        return true;
+        true
     }
 
     fn update_term(&mut self, term: u64) -> bool {
@@ -266,6 +307,8 @@ pub struct Node {
     state: NodeState,
     storage: Arc<Box<dyn Storage>>,
     rx: Receiver<NodeMessage>,
+    election_timeout: Duration,
+    election_timer: Instant,
 }
 
 impl Node {
@@ -273,8 +316,15 @@ impl Node {
         state: NodeState,
         rx: Receiver<NodeMessage>,
         storage: Arc<Box<dyn Storage>>,
+        election_timeout: Duration,
     ) -> Self {
-        Self { state, rx, storage }
+        Self {
+            state,
+            rx,
+            storage,
+            election_timeout,
+            election_timer: Instant::now() + election_timeout,
+        }
     }
 
     pub async fn run(&mut self) {
@@ -288,6 +338,7 @@ impl Node {
                 RpcMessage::StateRequest(req) => self.handle_state(req),
                 RpcMessage::RequestVote(req) => self.handle_request_vote(req),
                 RpcMessage::AppendLogRequest(req) => self.handle_append_log(req),
+                RpcMessage::HeartbeatRequest(req) => self.handle_heartbeat(req),
                 _ => RpcMessage::Error(ErrorResponse {
                     err_msg: "unsupported rpc request".to_string(),
                 }),
@@ -332,22 +383,56 @@ impl Node {
         }
 
         RpcMessage::RequestVoteResponse(RequestVoteResponse {
-            success,
+            ok: success,
             term: new_term,
         })
     }
 
     pub fn handle_append_log(&mut self, request: AppendLogRequest) -> RpcMessage {
+        self.election_timer = Instant::now() + self.election_timeout;
+
         let (success, new_term) = self.state.append_log(
-            request.leader_id, request.leader_term, request.prev_log_index, request.prev_log_term,
-            request.leader_commit_index, request.leader_log,
+            request.leader_id,
+            request.leader_term,
+            request.prev_log_index,
+            request.prev_log_term,
+            request.leader_commit_index,
+            request.leader_log,
         );
 
         if self.storage.save(&self.state).is_err() {
-            return RpcMessage::Error(ErrorResponse{err_msg: "persistent save failed".into()});
+            return RpcMessage::Error(ErrorResponse {
+                err_msg: "persistent save failed".into(),
+            });
         }
 
-        RpcMessage::AppendLogResponse(AppendLogResponse{ok: success, term: new_term})
+        RpcMessage::AppendLogResponse(AppendLogResponse {
+            ok: success,
+            term: new_term,
+        })
+    }
+
+    pub fn handle_heartbeat(&mut self, request: HeartbeatRequest) -> RpcMessage {
+        self.election_timer = Instant::now() + self.election_timeout;
+
+        let (success, new_term) = self.state.heartbeat(
+            request.leader_id,
+            request.leader_term,
+            request.prev_log_index,
+            request.prev_log_term,
+            request.leader_commit_index,
+        );
+
+        if self.storage.save(&self.state).is_err() {
+            return RpcMessage::Error(ErrorResponse {
+                err_msg: "persistent save failed".into(),
+            });
+        }
+
+        RpcMessage::HeartbeatResponse(HeartbeatResponse {
+            ok: success,
+            term: new_term,
+        })
     }
 }
 
