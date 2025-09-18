@@ -135,15 +135,20 @@ async fn handle_request(
 
             Ok(Response::new(msg, false))
         }
+        Ok(RpcMessage::AppendLogResponse(resp)) => {
+            let msg = serde_json::to_string(&resp)?;
+
+            Ok(Response::new(msg, false))
+        }
         _ => {
-            let resp = RpcMessage::Error(ErrorResponse{
+            let resp = RpcMessage::Error(ErrorResponse {
                 err_msg: "unknown request".to_string(),
             });
-            
+
             let msg = serde_json::to_string(&resp)?;
-            
+
             Ok(Response::new(msg, false))
-        },
+        }
     }
 }
 

@@ -1,4 +1,5 @@
-use crate::state::{NodeId, NodeRole};
+use crate::state;
+use crate::state::{Index, NodeId, NodeRole};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -17,6 +18,10 @@ pub enum RpcMessage {
     StateRequest(StateRequest),
     #[serde(rename = "StateResponse")]
     StateResponse(StateResponse),
+    #[serde(rename = "AppendLogRequest")]
+    AppendLogRequest(AppendLogRequest),
+    #[serde(rename = "AppendLogResponse")]
+    AppendLogResponse(AppendLogResponse),
     #[serde(rename = "ErrorResponse")]
     Error(ErrorResponse),
 }
@@ -39,7 +44,7 @@ pub struct RequestVoteRequest {
     pub node_id: NodeId,
     pub term: u64,
     pub last_log_term: u64,
-    pub last_log_index: u64,
+    pub last_log_index: Index,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,4 +68,20 @@ pub struct RequestVoteResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ErrorResponse {
     pub err_msg: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AppendLogRequest {
+    pub leader_id: NodeId,
+    pub leader_term: u64,
+    pub prev_log_index: Index,
+    pub prev_log_term: u64,
+    pub leader_commit_index: Index,
+    pub leader_log: Vec<state::LogEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AppendLogResponse {
+    pub ok: bool,
+    pub term: u64,
 }
