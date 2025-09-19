@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  node1:
+    build: .
+    container_name: node1
+    command: /usr/local/bin/app --id node1 --addr 0.0.0.0:8081 --log-path /data/node1.json --nodes node2=node2:8082,node3=node3:8083
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./data:/data
+
+  node2:
+    build: .
+    container_name: node2
+    command: /usr/local/bin/app --id node2 --addr 0.0.0.0:8082 --log-path /data/node2.json --nodes node1=node1:8081,node3=node3:8083
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./data:/data
+
+  node3:
+    build: .
+    container_name: node3
+    command: /usr/local/bin/app --id node3 --addr 0.0.0.0:8083 --log-path /data/node3.json --nodes node1=node1:8081,node2=node2:8082
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./data:/data

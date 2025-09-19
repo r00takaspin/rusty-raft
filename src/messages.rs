@@ -1,9 +1,9 @@
 use crate::state;
-use crate::state::{Index, NodeId, NodeRole};
+pub(crate) use crate::state::{Index, NodeId, NodeRole};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "data")]
 pub enum RpcMessage {
     #[serde(rename = "SetRequest")]
@@ -35,15 +35,15 @@ pub struct NodeMessage {
     pub resp_tx: Option<oneshot::Sender<RpcMessage>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SetRequest {
     pub command: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct StateRequest {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct RequestVoteRequest {
     pub node_id: NodeId,
     pub term: u64,
@@ -51,12 +51,12 @@ pub struct RequestVoteRequest {
     pub last_log_index: Index,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SetResponse {
     pub ok: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct StateResponse {
     pub node_id: NodeId,
     pub term: u64,

@@ -1,14 +1,16 @@
 use crate::messages::*;
 use crate::state::NodeRole::{Candidate, Follower, Leader};
 use crate::storage::Storage;
+use crate::transport::client::Client;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::Receiver;
-use tokio::time::Instant;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{Instant, sleep_until};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum NodeRole {
@@ -18,6 +20,8 @@ pub enum NodeRole {
 }
 
 pub type NodeId = String;
+pub type NodeAddr = String;
+
 pub type Index = usize;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -99,30 +103,32 @@ impl Display for NodeRole {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeState {
     node_id: NodeId,
+    nodes: Vec<(NodeId, NodeAddr)>,
     role: NodeRole,
-    peers: Vec<String>,
     term: u64,
     log: Vec<LogEntry>,
     voted_for: Option<NodeId>,
     commit_index: Index,
     leader_id: Option<NodeId>,
+    votes_num: usize,
 }
 
 impl NodeState {
-    pub fn default(node_id: NodeId, peers: Vec<String>) -> NodeState {
+    pub fn default(node_id: NodeId, nodes: Vec<(NodeId, NodeAddr)>) -> NodeState {
         // initialize node with initial replication log
         let mut log_entries = vec![];
         log_entries.push(LogEntry::initial());
 
         NodeState {
             node_id,
-            peers,
+            nodes,
             role: Follower,
             term: 0,
             voted_for: None,
             log: log_entries,
             commit_index: 0,
             leader_id: None,
+            votes_num: 0,
         }
     }
 
@@ -167,6 +173,7 @@ impl NodeState {
         }
 
         self.voted_for = Some(node_id);
+        self.role = Follower;
 
         // successfully give vote to candidate
         (true, self.term)
@@ -222,6 +229,7 @@ impl NodeState {
 
         self.leader_id = Some(leader_id);
         self.commit_index = last_index_to_commit;
+        self.role = Follower;
 
         (true, self.term)
     }
@@ -261,6 +269,7 @@ impl NodeState {
         }
 
         self.leader_id = Some(leader_id);
+        self.role = Follower;
 
         (true, self.term)
     }
@@ -287,6 +296,16 @@ impl NodeState {
         true
     }
 
+    pub fn become_candidate(&mut self) -> Result<(), anyhow::Error> {
+        self.voted_for = Some(self.node_id.clone());
+        self.leader_id = None;
+        self.role.become_candidate()?;
+        self.term += 1;
+        self.votes_num = 1; // votes for himself
+
+        Ok(())
+    }
+
     fn update_term(&mut self, term: u64) -> bool {
         if term >= self.term {
             self.term = term;
@@ -301,52 +320,165 @@ impl NodeState {
     fn add_log(&mut self, log: LogEntry) {
         self.log.push(log);
     }
+
+    pub fn incr_votes(&mut self) -> Result<bool, anyhow::Error> {
+        self.votes_num += 1;
+
+        info!(
+            "node: {} got {}/{} votes",
+            self.node_id,
+            self.votes_num,
+            self.nodes.len()
+        );
+
+        if self.votes_num >= self.nodes.len() / 2 + 1 {
+            self.role.become_leader()?;
+
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 pub struct Node {
     state: NodeState,
     storage: Arc<Box<dyn Storage>>,
-    rx: Receiver<NodeMessage>,
+    api_rx: Receiver<NodeMessage>,
+    client_tx: Sender<(NodeId, RpcMessage)>,
+    client_rx: Receiver<(NodeId, RpcMessage)>,
     election_timeout: Duration,
     election_timer: Instant,
+    heartbeat_timeout: Duration,
+    heartbeat_timer: Instant,
 }
 
 impl Node {
     pub fn new(
         state: NodeState,
-        rx: Receiver<NodeMessage>,
+        api_rx: Receiver<NodeMessage>,
+        client_tx: Sender<(NodeId, RpcMessage)>,
+        client_rx: Receiver<(NodeId, RpcMessage)>,
         storage: Arc<Box<dyn Storage>>,
         election_timeout: Duration,
+        heartbeat_timeout: Duration,
     ) -> Self {
         Self {
             state,
-            rx,
+            api_rx,
+            client_tx,
+            client_rx,
             storage,
             election_timeout,
             election_timer: Instant::now() + election_timeout,
+            heartbeat_timeout,
+            heartbeat_timer: Instant::now() + heartbeat_timeout,
         }
     }
 
     pub async fn run(&mut self) {
         info!("starting as {}", self.state.role);
 
-        while let Some(request) = self.rx.recv().await {
-            let resp_rx = request.resp_tx.unwrap();
+        loop {
+            tokio::select! {
+                // handle network responses
+                Some((node_id, response) ) = self.client_rx.recv() => {
+                    self.handle_response(response);
+                }
+                // incoming api requests loop
+                Some(request) = self.api_rx.recv() => {
+                    if request.resp_tx.is_none() {
+                        error!("node: request response channel is empty");
+                    }
 
-            let msg = match request.rpc_message {
-                RpcMessage::SetRequest(req) => self.handle_set(req),
-                RpcMessage::StateRequest(req) => self.handle_state(req),
-                RpcMessage::RequestVote(req) => self.handle_request_vote(req),
-                RpcMessage::AppendLogRequest(req) => self.handle_append_log(req),
-                RpcMessage::HeartbeatRequest(req) => self.handle_heartbeat(req),
-                _ => RpcMessage::Error(ErrorResponse {
-                    err_msg: "unsupported rpc request".to_string(),
-                }),
-            };
+                    let rx_resp = request.resp_tx.unwrap();
 
-            if resp_rx.send(msg).is_err() {
-                error!("response channel was closed");
+                    let response = self.handle_request(request.rpc_message);
+
+                    if rx_resp.send(response).is_err() {
+                        error!("node: oneshot response channel closed");
+                    }
+                }
+                _ = sleep_until(self.election_timer) => {
+                    let _ = self.make_election().await.map_err(|err| {
+                        error!("node: make_election failure: {:?}", err);
+                    });
+                },
+                _ = sleep_until(self.heartbeat_timer) => {
+                    let _ = self.send_heartbeats().await.map_err(|err| {
+                        error!("node: send_heartbeats failure: {:?}", err);
+                    });
+                }
             }
+        }
+    }
+
+    async fn make_election(&mut self) -> Result<(), anyhow::Error> {
+        self.state.become_candidate()?;
+        self.election_timer = Instant::now() + self.election_timeout;
+
+        info!("election started");
+
+        let state = &self.state;
+
+        for (node_id, addr) in self.state.nodes.iter() {
+            let node_id = node_id.clone();
+
+            let msg = RpcMessage::RequestVote(RequestVoteRequest {
+                node_id: state.node_id.clone(),
+                term: state.term,
+                last_log_index: state.log.len() - 1,
+                last_log_term: state.log[self.state.log.len() - 1].term,
+            });
+
+            if self.client_tx.send((addr.clone(), msg)).await.is_err() {
+                error!("node: failed to send message");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_heartbeats(&mut self) -> Result<(), anyhow::Error> {
+        if self.state.role != Leader {
+            return Ok(());
+        }
+
+        info!("sending heartbeats");
+
+        let state = &self.state;
+
+        self.heartbeat_timer = Instant::now() + self.heartbeat_timeout;
+
+        for (node_id, addr) in self.state.nodes.iter() {
+            let node_id = node_id.clone();
+
+            let msg = RpcMessage::HeartbeatRequest(HeartbeatRequest {
+                leader_id: state.node_id.clone(),
+                leader_term: state.term,
+                prev_log_index: state.log.len() - 1,
+                prev_log_term: state.log[self.state.log.len() - 1].term,
+                leader_commit_index: self.state.commit_index,
+            });
+
+            if self.client_tx.send((addr.clone(), msg)).await.is_err() {
+                error!("node: failed to send message");
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn handle_request(&mut self, request: RpcMessage) -> RpcMessage {
+        match request {
+            RpcMessage::SetRequest(req) => self.handle_set(req),
+            RpcMessage::StateRequest(req) => self.handle_state(req),
+            RpcMessage::RequestVote(req) => self.handle_request_vote(req),
+            RpcMessage::AppendLogRequest(req) => self.handle_append_log(req),
+            RpcMessage::HeartbeatRequest(req) => self.handle_heartbeat(req),
+            _ => RpcMessage::Error(ErrorResponse {
+                err_msg: "unsupported rpc request".to_string(),
+            }),
         }
     }
 
@@ -362,7 +494,7 @@ impl Node {
         })
     }
 
-    pub fn handle_request_vote(&mut self, request: RequestVoteRequest) -> RpcMessage {
+    fn handle_request_vote(&mut self, request: RequestVoteRequest) -> RpcMessage {
         let (success, new_term) = self.state.request_vote(
             request.node_id.clone(),
             request.term,
@@ -379,7 +511,11 @@ impl Node {
                 });
             }
 
-            info!("votes for {}", request.node_id.clone());
+            info!(
+                "{} votes for {}",
+                self.state.node_id,
+                request.node_id.clone()
+            );
         }
 
         RpcMessage::RequestVoteResponse(RequestVoteResponse {
@@ -433,6 +569,39 @@ impl Node {
             ok: success,
             term: new_term,
         })
+    }
+
+    fn handle_response(&mut self, response: RpcMessage) {
+        match response {
+            RpcMessage::RequestVoteResponse(resp) => self.handle_request_vote_response(resp),
+            RpcMessage::HeartbeatResponse(resp) => self.handle_heartbeat_response(resp),
+            _ => debug!("unhandled rpc response: {:?}", response),
+        }
+    }
+
+    fn handle_request_vote_response(&mut self, response: RequestVoteResponse) {
+        self.election_timer = Instant::now() + self.election_timeout;
+
+        if response.ok {
+            match self.state.incr_votes() {
+                Err(err) => error!("failed to increment votes: {}", err),
+                Ok(true) => {
+                    self.heartbeat_timer = Instant::now() + self.heartbeat_timeout;
+                    info!("{} becomes leader!", self.state.node_id)
+                }
+                Ok(false) => info!("{} get new vote", self.state.node_id),
+            }
+
+            info!("request vote success {:?}", response);
+        }
+
+        // todo: handle term
+    }
+
+    fn handle_heartbeat_response(&mut self, response: HeartbeatResponse) {
+        self.election_timer = Instant::now() + self.election_timeout;
+
+        // todo handle term
     }
 }
 
@@ -840,5 +1009,37 @@ mod tests {
         assert_eq!(true, ok);
         assert_eq!(term, 1);
         assert_eq!(0, state.commit_index);
+    }
+
+    #[test]
+    fn test_heartbreat_follower_term_ahead() {
+        let mut state = NodeState::default("1".into(), vec![]);
+        state.update_term(2);
+
+        let (ok, term) = state.heartbeat("2".into(), 1, 0, 0, 0);
+
+        assert_eq!(false, ok);
+        assert_eq!(term, 2);
+    }
+
+    #[test]
+    fn test_heartbeat_follower_log_index_not_exists() {
+        let mut state = NodeState::default("1".into(), vec![]);
+
+        let (ok, term) = state.heartbeat("2".into(), 0, 1, 0, 0);
+
+        assert_eq!(false, ok);
+        assert_eq!(term, 0);
+    }
+
+    #[test]
+    fn test_heartbeat_follower_log_wrong_log_term() {
+        let mut state = NodeState::default("1".into(), vec![]);
+        state.add_log(LogEntry::new(1, 2, "test command#1", None));
+
+        let (ok, term) = state.heartbeat("2".into(), 0, 1, 0, 0);
+
+        assert_eq!(false, ok);
+        assert_eq!(term, 0);
     }
 }

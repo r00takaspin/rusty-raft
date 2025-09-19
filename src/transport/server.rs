@@ -120,30 +120,10 @@ async fn handle_request(
         .map_err(|e| anyhow!("failed to send request: {}", e))?;
 
     match resp_rx.await {
-        Ok(RpcMessage::SetResponse(resp)) => {
-            let msg = serde_json::to_string(&resp)?;
+        Ok(response) => {
+            let response = serde_json::to_string(&response)?;
 
-            Ok(Response::new(msg, false))
-        }
-        Ok(RpcMessage::StateResponse(resp)) => {
-            let msg = serde_json::to_string(&resp)?;
-
-            Ok(Response::new(msg, false))
-        }
-        Ok(RpcMessage::RequestVoteResponse(resp)) => {
-            let msg = serde_json::to_string(&resp)?;
-
-            Ok(Response::new(msg, false))
-        }
-        Ok(RpcMessage::AppendLogResponse(resp)) => {
-            let msg = serde_json::to_string(&resp)?;
-
-            Ok(Response::new(msg, false))
-        }
-        Ok(RpcMessage::HeartbeatResponse(resp)) => {
-            let msg = serde_json::to_string(&resp)?;
-            
-            Ok(Response::new(msg, false))
+            Ok(Response::new(response, false))
         }
         _ => {
             let resp = RpcMessage::Error(ErrorResponse {
