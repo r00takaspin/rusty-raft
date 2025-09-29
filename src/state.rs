@@ -113,6 +113,7 @@ pub struct NodeState {
     votes_num: usize,
 }
 
+
 impl NodeState {
     pub fn default(node_id: NodeId, nodes: Vec<(NodeId, NodeAddr)>) -> NodeState {
         // initialize node with initial replication log
@@ -296,6 +297,15 @@ impl NodeState {
         true
     }
 
+    pub fn become_follower(&mut self, term: u64) -> Result<(), anyhow::Error> {
+        self.role.become_follower()?;
+        self.term = term;
+        self.voted_for = None;
+        self.votes_num = 0;
+
+        Ok(())
+    }
+
     pub fn become_candidate(&mut self) -> Result<(), anyhow::Error> {
         self.voted_for = Some(self.node_id.clone());
         self.leader_id = None;
@@ -345,8 +355,8 @@ pub struct Node {
     state: NodeState,
     storage: Arc<Box<dyn Storage>>,
     api_rx: Receiver<NodeMessage>,
-    client_tx: Sender<(NodeId, RpcMessage)>,
-    client_rx: Receiver<(NodeId, RpcMessage)>,
+    client_tx: Sender<(NodeAddr, RpcMessage)>,
+    client_rx: Receiver<(NodeAddr, RpcMessage)>,
     election_timeout: Duration,
     election_timer: Instant,
     heartbeat_timeout: Duration,
@@ -357,8 +367,8 @@ impl Node {
     pub fn new(
         state: NodeState,
         api_rx: Receiver<NodeMessage>,
-        client_tx: Sender<(NodeId, RpcMessage)>,
-        client_rx: Receiver<(NodeId, RpcMessage)>,
+        client_tx: Sender<(NodeAddr, RpcMessage)>,
+        client_rx: Receiver<(NodeAddr, RpcMessage)>,
         storage: Arc<Box<dyn Storage>>,
         election_timeout: Duration,
         heartbeat_timeout: Duration,
@@ -382,8 +392,8 @@ impl Node {
         loop {
             tokio::select! {
                 // handle network responses
-                Some((node_id, response) ) = self.client_rx.recv() => {
-                    self.handle_response(response);
+                Some((peer, response)) = self.client_rx.recv() => {
+                    self.handle_response(peer, response);
                 }
                 // incoming api requests loop
                 Some(request) = self.api_rx.recv() => {
@@ -450,9 +460,7 @@ impl Node {
 
         self.heartbeat_timer = Instant::now() + self.heartbeat_timeout;
 
-        for (node_id, addr) in self.state.nodes.iter() {
-            let node_id = node_id.clone();
-
+        for (_, addr) in self.state.nodes.iter() {
             let msg = RpcMessage::HeartbeatRequest(HeartbeatRequest {
                 leader_id: state.node_id.clone(),
                 leader_term: state.term,
@@ -482,8 +490,26 @@ impl Node {
         }
     }
 
-    pub fn handle_set(&mut self, _: SetRequest) -> RpcMessage {
-        RpcMessage::SetResponse(SetResponse { ok: true })
+    pub fn handle_set(&mut self, request: SetRequest) -> RpcMessage {
+        if self.state.role != Leader {
+            return RpcMessage::Error(ErrorResponse{err_msg: "operation requires leader role".to_string()});
+        }
+
+        let nodes = self.state.nodes.clone();
+
+        for (_, peer) in nodes.into_iter() {
+            let request = request.clone();
+            let peer = peer.clone();
+            let request = RpcMessage::SetRequest(request);
+
+            if let Err(err) = self.client_tx.try_send((peer, request)) {
+                error!("node: failed to send message: {:?}", err);
+
+                return RpcMessage::Error(ErrorResponse{err_msg: err.to_string()});
+            }
+        }
+
+        RpcMessage::SetResponse(SetResponse{ok: true})
     }
 
     pub fn handle_state(&mut self, _: StateRequest) -> RpcMessage {
@@ -516,6 +542,12 @@ impl Node {
                 self.state.node_id,
                 request.node_id.clone()
             );
+        }
+
+        if self.storage.save(&self.state).is_err() {
+            return RpcMessage::Error(ErrorResponse {
+                err_msg: "persistent save failed".into(),
+            });
         }
 
         RpcMessage::RequestVoteResponse(RequestVoteResponse {
@@ -571,15 +603,15 @@ impl Node {
         })
     }
 
-    fn handle_response(&mut self, response: RpcMessage) {
+    fn handle_response(&mut self,peer: String, response: RpcMessage) {
         match response {
-            RpcMessage::RequestVoteResponse(resp) => self.handle_request_vote_response(resp),
-            RpcMessage::HeartbeatResponse(resp) => self.handle_heartbeat_response(resp),
+            RpcMessage::RequestVoteResponse(resp) => self.handle_request_vote_response(peer, resp),
+            RpcMessage::HeartbeatResponse(resp) => self.handle_heartbeat_response(peer, resp),
             _ => debug!("unhandled rpc response: {:?}", response),
         }
     }
 
-    fn handle_request_vote_response(&mut self, response: RequestVoteResponse) {
+    fn handle_request_vote_response(&mut self, peer: String, response: RequestVoteResponse) {
         self.election_timer = Instant::now() + self.election_timeout;
 
         if response.ok {
@@ -595,13 +627,27 @@ impl Node {
             info!("request vote success {:?}", response);
         }
 
-        // todo: handle term
+        if response.term > self.state.term {
+            if let Err(err) = self.state.become_follower(response.term) {
+                error!("failed to become follower: {}", err);
+            }
+        }
     }
 
-    fn handle_heartbeat_response(&mut self, response: HeartbeatResponse) {
+    fn handle_heartbeat_response(&mut self, peer: String, response: HeartbeatResponse) {
         self.election_timer = Instant::now() + self.election_timeout;
 
-        // todo handle term
+        if response.ok {
+            return
+        }
+
+        if response.term > self.state.term {
+            if let Err(err) = self.state.become_follower(response.term) {
+                error!("failed to become follower: {}", err);
+            }
+        }
+
+        // todo: implement log forwarding
     }
 }
 

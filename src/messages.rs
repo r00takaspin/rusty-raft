@@ -35,7 +35,7 @@ pub struct NodeMessage {
     pub resp_tx: Option<oneshot::Sender<RpcMessage>>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SetRequest {
     pub command: String,
 }
